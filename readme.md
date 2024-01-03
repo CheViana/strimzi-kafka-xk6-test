@@ -259,7 +259,7 @@ kubectl apply -f test-pod.yml  <-- Pod definition, see above
 See test results using:
 
 ```
-kubectl logs test-xk6-loadtest -n loadtest -f
+kubectl logs test-xk6-loadtest-1 -n loadtest -f
 ```
 
 
