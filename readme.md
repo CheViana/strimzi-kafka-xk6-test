@@ -217,6 +217,9 @@ running, 0/3 VUs, 3 complete and 0 interrupted iterations
 default ✓ [ 100% ] 3 VUs  3/3 shared iters
 ```
 
+Another scenario I tried is [test-scenario-2.js](test-scenario-2.js). It differs in the way that each VU produces messages to all partitions, and consumes from one partition
+
+
 Here's pod definition that can be used to run this script in the k8s cluster:
 
 ```
