@@ -13,6 +13,9 @@ spec:
     - '/var/test-scenario/test-scenario.js'
     image: mostafamoradian/xk6-kafka:latest
     name: loadtest-xk6
+    env:
+    - name: LOG_LEVEL
+      value: debug
     resources: {}
     volumeMounts:
     - mountPath: /var/test-scenario
