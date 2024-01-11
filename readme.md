@@ -1,10 +1,12 @@
 # Performance testing Strimzi Kafka in the k8s cluster using xk6-kafka
 
-I'm going to describe how to performance test reading/writing from Kafka topic with multiple partitions using [xk6-kafka plugin](https://github.com/mostafa/xk6-kafka) for k6.
+I'm going to describe how to performance test reading/writing from Kafka topic with multiple partitions using [xk6-kafka plugin](https://github.com/mostafa/xk6-kafka) for k6. All resources mentioned here are available in [the repo](https://github.com/CheViana/strimzi-kafka-xk6-test/tree/main).
+
+## Topic to test
 
 Here's topic definition, using [Strimzi Kafka](https://strimzi.io/):
 
-```
+```yaml
 apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaTopic
 metadata:
@@ -19,125 +21,118 @@ spec:
    ...
 ```
 
+## Test scenario
+
 This topic has three partitions so it makes sense to test it with three virtual users, each reading from a separate partition.
-It also makes sense to me to write all messages at the beginning, using virtual user number 1, as the messages it writes will be distributed to the three partitions round-robin.
-Alternatively, virtual user can have a writer that produces to partition=virtual-user-number and reader that consumes from partition=virtual-user-number. I like this case less as it ties reader and writer, and hence is not very close to common real-world examples.
-
-So test scenario is going to execute like this:
+Test scenario is going to execute like this:
 
 ```
-Virtual user 0: setup code, instantiate producer
-Virtual user 1: produce 1000 messages, read 333 messages from partition 0
-Virtual user 2: read 333 messages from partition 1
-Virtual user 3: read 333 messages from partition 2
-Virtual user 0: teardown producer after the test is done
+Virtual user 1: create producer and consumer, produce 1000 messages to partitions 0 1 2, read 333 messages from partition 0, teardown producer and consumer
+Virtual user 2: create producer and consumer, produce 1000 messages to partitions 0 1 2, read 333 messages from partition 1, teardown producer and consumer
+Virtual user 3: create producer and consumer, produce 1000 messages to partitions 0 1 2, read 333 messages from partition 2, teardown producer and consumer
 ```
 
 
-Here's the code for the scenario script. It has debug prints that can be helpful to inspect how messages are consumed by virtual users.
+Here's the code for the scenario script. It has debug prints that can be helpful to inspect how messages are consumed by virtual users. For more logs, set environment variable `LOG_LEVEL=debug`, and pass param `connectLogger: true` to `Writer` and `Reader` constructor.
 
 An important aspect is that it is important to set `groupID`, `groupTopics` and `groupBalancers` when using Kafka bootstrap server. ReaderConfig has param `topic` which doesn't quite work with bootstrap server, it works with Kafka broker's address directly and with explicit partition number set.
 
 Another important aspect is that `consumer` is instantiated in test code (`default` function) - meaning each virtual user will use it's own consumer object. All consumers should belong to same consumer group though (`groupID` param). It is important to close consumer at the end of the function.
 
-```
+```javascript
 import {
     Writer,
     Reader,
     SCHEMA_TYPE_STRING,
     SchemaRegistry,
     GROUP_BALANCER_ROUND_ROBIN,
-    BALANCER_ROUND_ROBIN,
+    SECONDS
 } from "k6/x/kafka";
-import { check, sleep } from "k6";
-
+import { check } from "k6";
 
 const bootstrapServers = [
-  'kafka-bootsrap-1:9001',
+  'localhost:9091',
 ];
 
-let vus_amount = 3;
-let total_written = 0;
-let total_read = 0;
-
 export const options = {
-    vus: vus_amount,
-    iterations: "3",
+    vus: 3,
+    duration: "3h",
     thresholds: {
         kafka_writer_error_count: ["count == 0"],
         kafka_reader_error_count: ["count == 0"],
     },
 };
 
-const topicName = "my-topic";
+const topicName = "topic1";
 const schemaRegistry = new SchemaRegistry();
 
-const producer = new Writer({
-    brokers: bootstrapServers,
-    topic: topicName,
-    balancer: BALANCER_ROUND_ROBIN,  // or pick another balancer https://github.com/mostafa/xk6-kafka/blob/main/api-docs/index.d.ts#L66
-    // ... auth config
-});
-
-
-export function teardown(data) {
-    producer.close();
-}
-
 export default function () {
-  const consumer = new Reader({
-    brokers: bootstrapServers,
-    // it is important to set groupID, groupTopics and groupBalancers when using Kafka bootstrap server
-    // topic ReaderConfig param doesn't quite work with bootstrap server
-    groupID: topicName + "-group",
-    groupTopics: [topicName],
-    groupBalancers: [GROUP_BALANCER_ROUND_ROBIN], // or pick different balancer https://github.com/mostafa/xk6-kafka/blob/main/api-docs/index.d.ts#L75
-  });
 
-  let messageAmount = 1000;
+  let messageAmount = 9;
+  let batchSize = 10;
 
-  if (__VU == 1) {
+    const producer = new Writer({
+      brokers: bootstrapServers,
+      topic: topicName,,
+      balancer: "balancer_roundrobin",
+      requiredAcks: 1,
+      batchSize: batchSize,
+      maxAttempts: 3,
+      connectLogger: true,
+    });
+
     console.log('VU 1, writing messages. Iter ' + __ITER);
+    let firstMessageContent = null;
+    let lastMessageContent = null;
     for (let index = 0; index < messageAmount; index++) { 
-        let messages = [
-          {
+        let msgContent = "test-value-string-" + index + "-vu-" + __VU + "-iter-" + __ITER;
+        if (index == 0) {
+          firstMessageContent = msgContent;
+        }
+        if (index == messageAmount - 1) {
+          lastMessageContent = msgContent;
+        }
+        let messages = [];
+        for (let i = 0; i < batchSize; i++) {
+          messages.push({
             value: schemaRegistry.serialize({
-              data: "test-value-string-" + index + "-vu-" + __VU + "-iter-" + __ITER,
+              data: msgContent,
               schemaType: SCHEMA_TYPE_STRING,
             }),
-          },
-        ];
+          });
+        }
         producer.produce({ messages: messages });
-        total_written += messages.length;
+        
     }
-  }
+    producer.close();
+    console.log("First published msg: " + firstMessageContent);
+    console.log("Last published msg: " + lastMessageContent);
 
-  let consumerMsgAmount = Math.floor(messageAmount / vus_amount);
+    const consumer = new Reader({
+      brokers: bootstrapServers,
+      groupID: topicName + "-group",
+      groupTopics: [topicName],
+      groupBalancers: [GROUP_BALANCER_ROUND_ROBIN],
+      maxAttempts: 3,
+      connectLogger: true,
+      commitInterval: 1.2 * SECONDS,
+      heartbeatInterval: 3.5 * SECONDS,
+    });
 
-  let messages = consumer.consume({ limit: consumerMsgAmount});
-  total_read += messages.length;
+    let messages = consumer.consume({ limit: messageAmount * batchSize});
 
-  console.log("Amount of msgs received: " + messages.length + ", VU " + __VU + ", iter " + __ITER);
-  check(messages, {
-      "all messages returned": (msgs) => msgs.length == consumerMsgAmount,
-  });
+    console.log("Amount of msgs received: " + messages.length + ", VU " + __VU + ", iter " + __ITER);
 
-  let firstMessageValue = schemaRegistry.deserialize({
-    data: messages[0].value,
-    schemaType: SCHEMA_TYPE_STRING,
-  });
-  let lastMessageValue = schemaRegistry.deserialize({
-    data: messages[consumerMsgAmount - 1].value,
-    schemaType: SCHEMA_TYPE_STRING,
-  });
+    if (messages.length) {
 
-  check(messages[0], {
-    "Topic equals to": (msg) => msg["topic"] == topicName
-  });
+      check(messages[0], {
+        "Topic equals to": (msg) => msg["topic"] == topicName
+      });
 
-  console.log("First msg value " + firstMessageValue + ", offset" + messages[0]["offset"] + ", partition " + messages[0]["partition"] + ", VU " + __VU + ", iter " + __ITER);
-  console.log("Last msg value " + lastMessageValue + ", offset" + messages[consumerMsgAmount - 1]["offset"] + ", partition " + messages[0]["partition"] + ", VU " + __VU + ", iter " + __ITER);
-  consumer.close();
+    } else {
+      console.log("No messages received");
+    }
+    consumer.close();
 }
 ```
 
@@ -217,12 +212,21 @@ running, 0/3 VUs, 3 complete and 0 interrupted iterations
 default ✓ [ 100% ] 3 VUs  3/3 shared iters
 ```
 
-Another scenario I tried is [test-scenario-2.js](test-scenario-2.js). It differs in the way that each VU produces messages to all partitions, and consumes from one partition
+Test results to watch out for:
+- kafka_reader_error_count - should be zero or low
+- kafka_writer_error_count - should be zero or low
+- kafka_writer_message_count and kafka_reader_message_count should match
+
+There could be intermittent issues and error counts might be not zero. Yet they shouldn't be higher than like 5 out of 1000, and of course depend on how do you set SLO for your system. `Reader` and `Writer` are instantiated with `maxAttempts: 3` so they'll retry writing/reading. 
+If reader receives no messages this iteration, it won't fail any checks. It will just get those messages in the next test iteration. Main thing is to have total number match `kafka_writer_message_count == kafka_reader_message_count`.
 
 
-Here's pod definition that can be used to run this script in the k8s cluster:
+## Pod used to run test scenario, and command to run test in the k8s cluster
 
-```
+
+Here's pod definition that can be used to run the script in the k8s cluster:
+
+```yaml
 apiVersion: v1
 kind: Pod
 metadata:
@@ -238,6 +242,9 @@ spec:
     - '/var/test-scenario/test-scenario.js'
     image: mostafamoradian/xk6-kafka:latest
     name: loadtest-xk6
+    env:
+    - name: LOG_LEVEL
+      value: debug
     resources: {}
     volumeMounts:
     - mountPath: /var/test-scenario
@@ -255,7 +262,7 @@ Here's commands to run the scenario in your k8s cluster:
 
 ```
 kubectl create --namespace kafka topic.yaml <-- Strimzi definition of my-topic, see above
-kubectl create --namespace loadtest configmap kx6-test-scenario --from-file=test-scenario.js
+kubectl create --namespace loadtest configmap kx6-test-scenario --from-file=test-scenario.js <-- JS file with test scenario, see above
 kubectl apply -f test-pod.yml  <-- Pod definition, see above
 ```
 
@@ -264,7 +271,6 @@ See test results using:
 ```
 kubectl logs test-xk6-loadtest-1 -n loadtest -f
 ```
-
 
 
 In case your kafka cluster has TLS or other auth options enabled, xk6-kafka repo has useful [examples](https://github.com/mostafa/xk6-kafka/blob/main/scripts/test_sasl_auth.js) on how to setup those. Can mount server cert in the pod using volumes and volumeMounts.
